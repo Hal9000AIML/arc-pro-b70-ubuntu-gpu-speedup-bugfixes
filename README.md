@@ -125,11 +125,35 @@ On B70 the two llama.cpp backends have different strengths:
 
 `docs/backend-selection.md` has the rules.
 
+## Related repos (pick the right one for your workload)
+
+Three B70 inference repos exist; they're complementary, not duplicates.
+
+| Repo | Inference engine | GPU usage | Best for |
+|---|---|---|---|
+| **this repo** | llama.cpp (SYCL + Vulkan) | N cards → N different models | Multi-tier agent platforms; running 4–5 models concurrently; GGUF quants (Q4/Q5/Q6/Q8); maximum model flexibility |
+| [arc-pro-b70-inference-setup-ubuntu-server](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-ubuntu-server) | llama.cpp SYCL via installer *(also documents vLLM TP=4 option)* | 4 cards → 1 big model sharded *(vLLM TP=4)* or 4 independent *(llama.cpp)* | Building a box from scratch: bootable Ubuntu 24.04 autoinstall ISO, BIOS/hardware guide, DDR4 tuning, GuC firmware 70.60.0, systemd + watchdog. Use this FIRST to set up the machine, then apply this kit's patches on top |
+| [arc-pro-b70-inference-setup-windows](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-windows) | vLLM XPU (TP=4 across 4 B70s) | 4 cards → 1 big model, sharded | Windows workstation wanting vLLM tensor parallelism via WSL2 + Docker. Max single-model throughput (540 tok/s on 4× B70). Does not use llama.cpp |
+
+If you want **one big model at maximum throughput** (e.g., serving a single 70B to many users): the vLLM TP=4 path in the Ubuntu-server or Windows repo will beat what this kit can deliver — llama.cpp does not shard one model across GPUs, so it's bounded by single-B70 performance per process.
+
+If you want **multiple different models running concurrently** (agent platforms with router/code/fast/reasoning tiers, developer workstations with dynamic model choice): this kit is the right tool. One model per card, each independently tuned, 5 concurrent llama-servers tested.
+
+### Why we publish llama.cpp numbers, not a vLLM head-to-head
+
+We attempted a TP=1 vLLM benchmark on the same Qwen3-Coder-30B model (GPTQ 4-bit) on a freed B70 to put an exact number against our 57.7 tok/s llama.cpp figure. The attempt surfaced three practical blockers that most users will hit:
+
+1. **vLLM XPU container staleness** — the `vllm-xpu:gemma4-fixed` image from April shipped with vLLM v1 engine, which emits `XPU Graph is not supported in the current PyTorch version` and falls back to eager execution. Performance claims require a current image.
+2. **Single-card TP=1 memory pressure** — a co-tenant llama-server on the same card left only 3.36 GiB free on the B70; vLLM rejects startup below its `gpu-memory-utilization` ask. TP=1 comparison on a shared GPU needs the full card evacuated.
+3. **Architecture mismatch for multi-tier workloads** — vLLM's strength is TP=4 sharding of one model. Running a TP=1 comparison is informative about per-card raw throughput but doesn't reflect real deployment (you'd never run vLLM TP=1 on B70; you'd run TP=4).
+
+**The architectural bottom line stands without the benchmark:** vLLM TP=4 on 4× B70 will beat llama.cpp on a single model (the [Ubuntu installer repo](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-ubuntu-server) cites 540 tok/s on Qwen3.5-27B TP=4). llama.cpp wins for concurrent multi-model workloads. Pick the tool whose design matches your deployment, not the one with the bigger single-stream number.
+
 ## What's NOT in this kit
 
-- Windows support. These patches and flags are Linux-only. Intel's Windows Arc stack is a different beast.
+- Windows support. These patches and flags are Linux-only. Intel's Windows Arc stack is a different beast. If you're on Windows and need B70 inference, use the [Windows repo](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-windows) (vLLM via WSL2).
 - Model files. Bring your own GGUFs. The start scripts reference `/mnt/models/...` paths; edit to yours.
-- An installer. This is artifacts + scripts; you run them.
+- An installer. This is artifacts + scripts; you run them. For a bootable Ubuntu autoinstall ISO that stands up the whole box from bare metal, see the [Ubuntu server repo](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-ubuntu-server).
 
 ## Repository layout
 
