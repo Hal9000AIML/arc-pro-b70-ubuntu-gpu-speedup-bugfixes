@@ -35,6 +35,20 @@ If you have one or more Intel Arc Pro B70 cards and you want them to be useful f
 | OS | Ubuntu 24.04 (kernel 6.8+) |
 | Backends | llama.cpp SYCL (oneAPI 2024.2+) and llama.cpp Vulkan (Mesa 26.0.5) |
 
+## Before / after this kit (measured, same hardware, same model, same prompt)
+
+Same B70 card (GPU3), same Qwen3-Coder-30B-A3B model, same Fibonacci prompt, 300 max tokens, temperature 0.1:
+
+| Configuration | Result | Notes |
+|---|---|---|
+| **Stock llama.cpp SYCL** (no cherry-picks, no env vars, MoE model) | 🔴 **hangs at slot-init** | process alive but never opens port; silent hang for minutes |
+| Stock llama.cpp SYCL + `GGML_SYCL_DISABLE_OPT=1` (our documented env-var workaround, still no cherry-picks) | ≈ works but no MMVQ fusion / no K-quant native subgroup | expected ~40–45 tok/s per our research (not benched this session) |
+| **This kit** (cherry-picks + env vars + flags) | ✅ **59.6 tok/s** (avg of 3 runs: 59.90 / 59.91 / 59.06) | same card, same model, clean exit |
+| vLLM 0.17.0-xpu TP=1 (GPTQ-Int4, `--enforce-eager`, same card) | 13.85 tok/s (avg of 3: 13.85 / 13.84 / 13.85) | 4.3× slower than this kit on same hardware |
+| vLLM 0.17.0-xpu TP=1 without `--enforce-eager` (torch.compile) | 6.99 tok/s | 2× slower than eager; compile hurts on XPU |
+
+**The stock-llama.cpp hang on MoE models is exactly the bug this kit exists to fix.** Without `GGML_SYCL_DISABLE_OPT=1` and/or the `sycl: fused MoE mul_mat_vec_q for TG` cherry-pick, llama-server's slot initialization enters a broken reorder-MMVQ path on Xe2/BMG and never completes. Vanilla users see a process that starts, logs `srv load_model: initializing slots`, and then… nothing. No error, no response, no crash — just a hung server. This kit's **runtime fixes we discovered** section below documents every one of these workarounds.
+
 ## Headline numbers (single-stream, identical 300-tok prompt)
 
 | Tier | Model | Backend | GPU | tg tok/s | Notes |
