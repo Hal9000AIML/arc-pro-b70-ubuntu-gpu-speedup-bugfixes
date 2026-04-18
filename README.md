@@ -148,19 +148,37 @@ If you want **one big model at maximum throughput** (e.g., serving a single 70B 
 
 If you want **multiple different models running concurrently** (agent platforms with router/code/fast/reasoning tiers, developer workstations with dynamic model choice): this kit is the right tool. One model per card, each independently tuned, 5 concurrent llama-servers tested.
 
-### Why we publish llama.cpp numbers, not a vLLM head-to-head
+### llama.cpp vs vLLM TP=1 on B70 — measured head-to-head
 
-We attempted a TP=1 vLLM XPU benchmark on the same Qwen3-Coder-30B model (GPTQ-Int4) on a fully-evacuated B70 to put an exact number against our 57.7 tok/s llama.cpp figure. Three attempts. Partial progress, no final number. What we hit and what fixes it:
+| Engine | Backend | tg tok/s (avg of 3) | Notes |
+|---|---|---|---|
+| **llama.cpp + this kit** | SYCL + 11 cherry-picks | **59.6** | Qwen3-Coder-30B-A3B-Q5_K_M, GPU3 solo, `GGML_SYCL_DISABLE_OPT=1`, `-fa 0`, `-ngl 999 -c 16384` |
+| vLLM 0.17.0-xpu TP=1 | Intel XPU (Level Zero) | **13.85** | Same model family (Qwen3-Coder-30B-A3B-GPTQ-Int4 HF), same card, `--enforce-eager`, `--block-size 64`, `--dtype float16`, `VLLM_USE_V1=1` |
 
-1. **Stale vLLM XPU build.** The in-place build on our box was `vllm 0.1.dev1+gbd8bd5230.xpu` — a pre-release snapshot that predates the vLLM XPU v1 engine rewrite and the `vllm-xpu-kernels` package. This is ~12–18 months behind current production. Loading stalled at "0% Completed | 0/4" on safetensors shards for 5+ minutes while `EngineCore` burned CPU on what is almost certainly first-run XPU kernel JIT / CCL initialization code paths that recent releases have fixed.
-2. **PyTorch XPU memory-query bug on BMG/Xe2.** Even before the load stall, `torch.xpu.mem_get_info()` returned incorrect "free" values on the B70, triggering vLLM's "Free memory less than desired GPU memory utilization" ValueError on an otherwise-empty card. Documented in [pytorch/pytorch#162909](https://github.com/pytorch/pytorch/issues/162909). Worked around by dropping `--gpu-memory-utilization` to 0.75, but the underlying query was still returning artificially low numbers.
-3. **No Marlin on XPU.** vLLM emits `WARNING: Currently, the 4-bit gptq_gemm kernel for GPTQ is buggy. Please switch to gptq_marlin.` Marlin is CUDA-only; the XPU-native WNA16 / grouped-GEMM path exists only in recent Intel-maintained XPU builds.
+**llama.cpp beats vLLM TP=1 by 4.3× on a single B70 for this model.** Both runs were on the same physical GPU3, card evacuated, prompt "Write an iterative Python function that computes the nth Fibonacci number.", `max_tokens=300`, `temperature=0.1`. llama.cpp numbers from `timings.predicted_per_second`. vLLM numbers from `300 tok / elapsed`.
 
-**The production fix (per Intel):** use `intel/llm-scaler-vllm:0.14.0-b8.1` (March 2026), which explicitly validates `Qwen3-30B-A3B-GPTQ-Int4` on BMG-G31, ships vLLM 0.10.0+, PyTorch 2.10+xpu, and the current `vllm-xpu-kernels` package. That's the path to get a real vLLM TP=1 number on this hardware. We didn't switch images in-session because it's a ~20 GB download plus full re-setup, and ODIN workload continuity was the priority.
+Bench environment (2026-04-18):
+- Container: `intel/vllm:0.17.0-xpu` (the current Intel-maintained image)
+- vLLM: `0.1.dev14456+gde3f7fe65` (XPU dev build inside the image)
+- PyTorch: `2.10.0+xpu`
+- Model loaded in 93s, Application startup complete, 3 warmed runs at 21.65s each for 300 tokens
 
-**Do not use `ipex-llm`.** Intel archived that repo on 2026-01-28 citing security issues and redirected users to `llm-scaler`.
+**Why vLLM is slower on TP=1 on B70 despite being the "faster" engine on CUDA:**
 
-**The architectural bottom line stands without the benchmark:** vLLM TP=4 on 4× B70 will beat llama.cpp on a single model (the [Ubuntu installer repo](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-ubuntu-server) cites 540 tok/s on Qwen3.5-27B TP=4). llama.cpp wins for concurrent multi-model workloads. Pick the tool whose design matches your deployment, not the one with the bigger single-stream number. If you want a TP=1 vLLM number on B70, pull `intel/llm-scaler-vllm:0.14.0-b8.1` and report what you get — PRs welcome.
+1. **`--enforce-eager` is mandatory on XPU.** `XPU Graph is not supported in the current PyTorch version, disabling cudagraph_mode` — the log we see on every launch. No torch.compile + no CUDA Graphs = 2–3× perf left on the floor vs what vLLM does on an A100.
+2. **GPTQ kernel is the slow path.** vLLM emits `WARNING: Currently, the 4-bit gptq_gemm kernel for GPTQ is buggy. Please switch to gptq_marlin.` Marlin is CUDA-only; XPU has no equivalent fused INT4 kernel. vLLM falls back to a generic GPTQ path that is substantially slower than llama.cpp's hand-tuned SYCL Q5_K_M kernel with our cherry-picked MoE MMVQ fusion and K-quant native-subgroup-size DMMV patches.
+3. **MoE token-generation path.** Our patch `sycl: fused MoE mul_mat_vec_q for TG` (d99e97537) alone is +47% on Qwen3-Coder-30B MoE. vLLM XPU doesn't have the equivalent fusion yet.
+4. **First-token overhead dominates short prompts.** Our 20-token prompt amortizes badly on vLLM's pipeline; with longer prompts and concurrent streams the gap narrows.
+
+**Where vLLM still wins on B70:** tensor parallelism. TP=4 across 4× B70 with `intel/vllm:0.17.0-xpu` is documented at 540 tok/s on Qwen3.5-27B BF16 TP=4 ([Ubuntu installer repo](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-ubuntu-server)). llama.cpp cannot shard one model across GPUs — it's bounded by single-card performance per process. So:
+
+- **Single model, max throughput:** vLLM TP=4.
+- **One model on one card:** llama.cpp wins by 4×.
+- **Multiple different models concurrently (ODIN-style agent platform):** llama.cpp is the only option.
+
+**Do not use `ipex-llm`.** Intel archived that repo on 2026-01-28 citing security issues and redirected users to `llm-scaler`/`intel/vllm`.
+
+This measurement is reproducible — exact commands are in `docs/benchmarks.md`.
 
 ## What's NOT in this kit
 
