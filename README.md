@@ -97,24 +97,33 @@ Every one of these came from a measured regression or crash on our 4× B70 box. 
 ## Quick start
 
 ```bash
-# 1. Install Mesa 26.0.5 (Vulkan backend)
-sudo bash scripts/install-mesa.sh
+# Prereq: install Intel oneAPI Base Toolkit at /opt/intel/oneapi (SYCL backend).
+# Intel's installer, not something we bundle:
+# https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html
 
-# 2. Install oneAPI (SYCL backend) — Intel's repo, not packaged here
-# Follow https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html
+# One-shot installer — Mesa PPA + patch + build (SYCL + Vulkan) + systemd + stage start scripts
+sudo -E MODELS_DIR=/mnt/models bash install.sh
 
-# 3. Build both backends with the cherry-picks applied
-bash scripts/build-sycl.sh    # ~25 min
-bash scripts/build-vulkan.sh  # ~5 min
+# Generate tuned start scripts for your layout (auto-picks SYCL vs Vulkan per card/model):
+python3 scripts/b70-plan.py --scan /mnt/models > layout.yaml
+$EDITOR layout.yaml                                # assign models to cards
+python3 scripts/b70-plan.py --config layout.yaml   # writes ~/start_<port>.sh
 
-# 4. Install systemd template
-sudo cp systemd/llamacpp@.service /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# 5. Drop your model files in /mnt/models, edit scripts/start_*.sh paths,
-#    put them in ~/, then:
-systemctl --user start llamacpp@8000  # etc.
+# Launch a tier (systemd):
+sudo systemctl --user start llamacpp@8000
 ```
+
+`install.sh` is idempotent — re-run safely after adding cards/models or upgrading oneAPI.
+
+`scripts/b70-plan.py` is the backend auto-selector. It reads a YAML describing which model runs on which card(s) and applies the rules in `docs/backend-selection.md`:
+
+- Spec-decoding tier → Vulkan
+- MoE on solo card → SYCL + `GGML_SYCL_DISABLE_OPT=1`
+- Co-tenant card, smaller model → Vulkan (cedes compute to heavier neighbor)
+- Multi-card split → SYCL (better multi-device support on B70)
+- Dense solo card → SYCL
+
+Run `python3 scripts/b70-plan.py --config layout.yaml --dry-run` to preview decisions before writing scripts.
 
 ## Why two backends?
 
