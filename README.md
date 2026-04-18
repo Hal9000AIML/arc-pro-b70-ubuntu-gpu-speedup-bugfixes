@@ -150,13 +150,17 @@ If you want **multiple different models running concurrently** (agent platforms 
 
 ### Why we publish llama.cpp numbers, not a vLLM head-to-head
 
-We attempted a TP=1 vLLM benchmark on the same Qwen3-Coder-30B model (GPTQ 4-bit) on a freed B70 to put an exact number against our 57.7 tok/s llama.cpp figure. The attempt surfaced three practical blockers that most users will hit:
+We attempted a TP=1 vLLM XPU benchmark on the same Qwen3-Coder-30B model (GPTQ-Int4) on a fully-evacuated B70 to put an exact number against our 57.7 tok/s llama.cpp figure. Three attempts. Partial progress, no final number. What we hit and what fixes it:
 
-1. **vLLM XPU container staleness** — the `vllm-xpu:gemma4-fixed` image from April shipped with vLLM v1 engine, which emits `XPU Graph is not supported in the current PyTorch version` and falls back to eager execution. Performance claims require a current image.
-2. **Single-card TP=1 memory pressure** — a co-tenant llama-server on the same card left only 3.36 GiB free on the B70; vLLM rejects startup below its `gpu-memory-utilization` ask. TP=1 comparison on a shared GPU needs the full card evacuated.
-3. **Architecture mismatch for multi-tier workloads** — vLLM's strength is TP=4 sharding of one model. Running a TP=1 comparison is informative about per-card raw throughput but doesn't reflect real deployment (you'd never run vLLM TP=1 on B70; you'd run TP=4).
+1. **Stale vLLM XPU build.** The in-place build on our box was `vllm 0.1.dev1+gbd8bd5230.xpu` — a pre-release snapshot that predates the vLLM XPU v1 engine rewrite and the `vllm-xpu-kernels` package. This is ~12–18 months behind current production. Loading stalled at "0% Completed | 0/4" on safetensors shards for 5+ minutes while `EngineCore` burned CPU on what is almost certainly first-run XPU kernel JIT / CCL initialization code paths that recent releases have fixed.
+2. **PyTorch XPU memory-query bug on BMG/Xe2.** Even before the load stall, `torch.xpu.mem_get_info()` returned incorrect "free" values on the B70, triggering vLLM's "Free memory less than desired GPU memory utilization" ValueError on an otherwise-empty card. Documented in [pytorch/pytorch#162909](https://github.com/pytorch/pytorch/issues/162909). Worked around by dropping `--gpu-memory-utilization` to 0.75, but the underlying query was still returning artificially low numbers.
+3. **No Marlin on XPU.** vLLM emits `WARNING: Currently, the 4-bit gptq_gemm kernel for GPTQ is buggy. Please switch to gptq_marlin.` Marlin is CUDA-only; the XPU-native WNA16 / grouped-GEMM path exists only in recent Intel-maintained XPU builds.
 
-**The architectural bottom line stands without the benchmark:** vLLM TP=4 on 4× B70 will beat llama.cpp on a single model (the [Ubuntu installer repo](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-ubuntu-server) cites 540 tok/s on Qwen3.5-27B TP=4). llama.cpp wins for concurrent multi-model workloads. Pick the tool whose design matches your deployment, not the one with the bigger single-stream number.
+**The production fix (per Intel):** use `intel/llm-scaler-vllm:0.14.0-b8.1` (March 2026), which explicitly validates `Qwen3-30B-A3B-GPTQ-Int4` on BMG-G31, ships vLLM 0.10.0+, PyTorch 2.10+xpu, and the current `vllm-xpu-kernels` package. That's the path to get a real vLLM TP=1 number on this hardware. We didn't switch images in-session because it's a ~20 GB download plus full re-setup, and ODIN workload continuity was the priority.
+
+**Do not use `ipex-llm`.** Intel archived that repo on 2026-01-28 citing security issues and redirected users to `llm-scaler`.
+
+**The architectural bottom line stands without the benchmark:** vLLM TP=4 on 4× B70 will beat llama.cpp on a single model (the [Ubuntu installer repo](https://github.com/Hal9000AIML/arc-pro-b70-inference-setup-ubuntu-server) cites 540 tok/s on Qwen3.5-27B TP=4). llama.cpp wins for concurrent multi-model workloads. Pick the tool whose design matches your deployment, not the one with the bigger single-stream number. If you want a TP=1 vLLM number on B70, pull `intel/llm-scaler-vllm:0.14.0-b8.1` and report what you get — PRs welcome.
 
 ## What's NOT in this kit
 
